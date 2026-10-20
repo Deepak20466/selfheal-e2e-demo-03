@@ -279,9 +279,7 @@ def _prompt(
 
 def _apply_failure_context(reason: str, repository: Path) -> str:
     """Add a small exact-source window for a sanitized, validated apply location."""
-    match = re.search(
-        r"git apply --check rejected ([A-Za-z0-9_./-]+) at line (\d+)", reason
-    )
+    match = re.search(r"git apply --check rejected ([A-Za-z0-9_./-]+) at line (\d+)", reason)
     if not match:
         return reason
     parts = match.group(1).split("/")
