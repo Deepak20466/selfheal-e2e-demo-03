@@ -22,6 +22,8 @@ GROQ_API_ROOT = "https://api.groq.com/openai/v1"
 GROQ_MODEL = "openai/gpt-oss-120b"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_QUOTA_CONFIRMATION_AGE_SECONDS = 15 * 60
+GEMINI_REQUEST_TIMEOUT_SECONDS = 120
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 45
 
 REPAIR_JSON_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -46,6 +48,10 @@ class ProviderError(RuntimeError):
 
 class FreeQuotaUnavailable(ProviderError):
     """A provider has no usable verified free quota for this request."""
+
+
+class GeminiModelTemporarilyUnavailable(ProviderError):
+    """A Gemini model is temporarily unavailable or overloaded."""
 
 
 @dataclass(frozen=True)
@@ -84,11 +90,29 @@ def _request_json(
             raise ProviderError(f"{provider} endpoint attempted to redirect the request")
 
     try:
-        with urllib.request.build_opener(RejectRedirect).open(request, timeout=45) as response:
+        timeout_seconds = (
+            GEMINI_REQUEST_TIMEOUT_SECONDS
+            if provider == "Gemini"
+            else DEFAULT_REQUEST_TIMEOUT_SECONDS
+        )
+        with urllib.request.build_opener(RejectRedirect).open(
+            request, timeout=timeout_seconds
+        ) as response:
             content = response.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
         if exc.code == 429:
             raise FreeQuotaUnavailable(f"{provider} free quota is unavailable") from None
+        if provider == "Gemini" and exc.code == 404:
+            # Gemini can list a legacy model while denying generation for a
+            # project that is not eligible for that model. Treat that model as
+            # unavailable and continue only through separately attested
+            # free-tier Gemini candidates or other independently gated
+            # providers.
+            raise FreeQuotaUnavailable("Gemini model is unavailable to this project") from None
+        if provider == "Gemini" and exc.code == 503:
+            raise GeminiModelTemporarilyUnavailable(
+                "Gemini model is temporarily unavailable"
+            ) from None
         raise ProviderError(f"{provider} returned HTTP {exc.code}") from None
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise ProviderError(f"{provider} request failed ({type(exc).__name__})") from None
@@ -122,7 +146,7 @@ class GeminiProvider:
     """Direct Gemini API adapter with explicit project and model quota gates.
 
     Google's API does not expose account-specific remaining free quota to an
-    API-key-only caller. The two model quota flags therefore represent a
+    API-key-only caller. The model quota flags therefore represent a
     just-checked AI Studio quota view; the project flag attests the key belongs
     to a project with billing disabled and no purchased credits. The adapter
     also verifies current model availability and supported generation methods
@@ -131,8 +155,11 @@ class GeminiProvider:
 
     name = "gemini"
     _MODELS = (
+        ("gemini-3.8-flash", "GEMINI_38_FLASH_FREE_QUOTA"),
+        ("gemini-3.5-flash-lite", "GEMINI_35_FLASH_LITE_FREE_QUOTA"),
         ("gemini-2.5-pro", "GEMINI_25_PRO_FREE_QUOTA"),
         ("gemini-2.5-flash", "GEMINI_25_FLASH_FREE_QUOTA"),
+        ("gemini-2.5-flash-lite", "GEMINI_25_FLASH_LITE_FREE_QUOTA"),
     )
 
     def __init__(
@@ -151,17 +178,17 @@ class GeminiProvider:
             if project_free_tier_confirmed is not None
             else os.environ.get("GEMINI_FREE_TIER_CONFIRMED")
         )
+        overrides = {
+            "gemini-2.5-pro": pro_quota_confirmed,
+            "gemini-2.5-flash": flash_quota_confirmed,
+        }
         self.quota_confirmed = {
-            "gemini-2.5-pro": (
-                pro_quota_confirmed
-                if pro_quota_confirmed is not None
-                else os.environ.get("GEMINI_25_PRO_FREE_QUOTA")
-            ),
-            "gemini-2.5-flash": (
-                flash_quota_confirmed
-                if flash_quota_confirmed is not None
-                else os.environ.get("GEMINI_25_FLASH_FREE_QUOTA")
-            ),
+            model: (
+                overrides[model]
+                if model in overrides and overrides[model] is not None
+                else os.environ.get(flag)
+            )
+            for model, flag in self._MODELS
         }
         self.quota_checked_utc = (
             quota_checked_utc
@@ -199,7 +226,7 @@ class GeminiProvider:
             )
         requested = [model for model, flag in self._MODELS if _is_true(self.quota_confirmed[model])]
         if not requested:
-            raise FreeQuotaUnavailable("Gemini 2.5 Pro and Flash have no confirmed free quota")
+            raise FreeQuotaUnavailable("no supported Gemini model has confirmed free quota")
 
         key = _api_key(self.api_key, "Gemini")
         del key  # Validate before the read-only models request; never put it in a URL.
@@ -282,11 +309,11 @@ class GeminiProvider:
         models = self._eligible_models()
         if not models:
             raise FreeQuotaUnavailable("no confirmed free Gemini model is currently available")
-        unavailable: FreeQuotaUnavailable | None = None
+        unavailable: ProviderError | None = None
         for model in models:
             try:
                 return self._generate(model, prompt)
-            except FreeQuotaUnavailable as exc:
+            except (FreeQuotaUnavailable, GeminiModelTemporarilyUnavailable) as exc:
                 unavailable = exc
         raise unavailable or FreeQuotaUnavailable("Gemini free quota is unavailable")
 
